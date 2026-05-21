@@ -1,0 +1,612 @@
+name: Benchmark - zono vs merjs
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: benchmark-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GIT_CONFIG_COUNT: 1
+  GIT_CONFIG_KEY_0: init.defaultBranch
+  GIT_CONFIG_VALUE_0: main
+  BENCHMARK_RESULTS_BRANCH: benchmarks
+  ZONO_ZIG_VERSION: 0.16.0
+  ZONO_RUNTIME_DEPS: "zio v0.11.0"
+  MERJS_ZIG_VERSION: 0.16.0
+  MERJS_RUNTIME_DEPS: "0"
+  MERJS_BASELINE_REF: v0.2.5
+  BENCH_THREADS: 2
+  BENCH_CONNECTIONS: 100
+  BENCH_DURATION_SECONDS: 10
+  BENCH_WARMUP_SECONDS: 3
+  BENCH_RUNS: 3
+
+jobs:
+  benchmark_zono:
+    runs-on: ubuntu-latest
+    name: zono API benchmark
+    outputs:
+      build_ms: ${{ steps.bench.outputs.build_ms }}
+      binary_size: ${{ steps.bench.outputs.binary_size }}
+      binary_bytes: ${{ steps.bench.outputs.binary_bytes }}
+      source_files: ${{ steps.bench.outputs.source_files }}
+      requests_per_sec: ${{ steps.bench.outputs.requests_per_sec }}
+      avg_latency: ${{ steps.bench.outputs.avg_latency }}
+      latency_p50: ${{ steps.bench.outputs.latency_p50 }}
+      latency_p75: ${{ steps.bench.outputs.latency_p75 }}
+      latency_p90: ${{ steps.bench.outputs.latency_p90 }}
+      latency_p99: ${{ steps.bench.outputs.latency_p99 }}
+      feature_benchmarks: ${{ steps.bench.outputs.feature_benchmarks }}
+      ram_mb: ${{ steps.bench.outputs.ram_mb }}
+      zig_version: ${{ steps.bench.outputs.zig_version }}
+      runtime_deps: ${{ steps.bench.outputs.runtime_deps }}
+
+    steps:
+      - name: Checkout zono
+        uses: actions/checkout@v6.0.2
+
+      - name: Setup Zig
+        uses: ./.github/actions/setup-zig
+        with:
+          version: ${{ env.ZONO_ZIG_VERSION }}
+
+      - name: Install wrk
+        run: sudo apt-get update && sudo apt-get install -y wrk
+
+      - name: Benchmark zono
+        id: bench
+        env:
+          ZONO_ZIG_VERSION: ${{ env.ZONO_ZIG_VERSION }}
+        run: |
+          set -euo pipefail
+
+          read_rss_kb() {
+            local pid="$1"
+            local rss
+            rss=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
+            if [ -z "$rss" ]; then
+              echo 0
+            else
+              echo "$rss"
+            fi
+          }
+
+          START=$(date +%s%N)
+          zig build example-benchmark -Doptimize=ReleaseFast
+          END=$(date +%s%N)
+          BUILD_MS=$(( (END - START) / 1000000 ))
+
+          ZONO_BIN=$(python3 - <<'PY'
+          from pathlib import Path
+
+          candidates = []
+          for path in Path(".zig-cache").rglob("*"):
+              if path.is_file() and path.name in {"zono-benchmark", "zono-benchmark.exe"}:
+                  candidates.append(path)
+
+          candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+          print(candidates[0].resolve().as_posix() if candidates else "")
+          PY
+          )
+
+          if [ -z "$ZONO_BIN" ]; then
+            echo "Could not locate the built zono-benchmark binary" >&2
+            exit 1
+          fi
+
+          ZONO_SIZE=$(du -sh "$ZONO_BIN" | cut -f1)
+          ZONO_BYTES=$(stat --format=%s "$ZONO_BIN")
+          ZONO_FILES=$(find src examples -type f -name '*.zig' | wc -l)
+
+          "$ZONO_BIN" &
+          ZONO_PID=$!
+          trap 'kill $ZONO_PID 2>/dev/null || true' EXIT
+
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:3003/api/json >/dev/null; then
+              break
+            fi
+            sleep 1
+            if [ "$attempt" -eq 30 ]; then
+              echo "zono benchmark server did not become ready in time" >&2
+              exit 1
+            fi
+          done
+
+          if [ $((BENCH_RUNS % 2)) -eq 0 ]; then
+            echo "BENCH_RUNS must be an odd number to compute a median" >&2
+            exit 1
+          fi
+
+          FEATURE_RESULT_FILE=$(mktemp)
+          POST_SCRIPT=$(mktemp)
+          CORS_SCRIPT=$(mktemp)
+          trap 'rm -f "$FEATURE_RESULT_FILE" "$POST_SCRIPT" "$CORS_SCRIPT"; kill $ZONO_PID 2>/dev/null || true' EXIT
+          ZONO_RSS_KB=$(read_rss_kb "$ZONO_PID")
+
+          cat > "$POST_SCRIPT" <<'LUA'
+          wrk.method = "POST"
+          wrk.body = '{"ok":true,"name":"zono"}'
+          wrk.headers["Content-Type"] = "application/json"
+          LUA
+
+          cat > "$CORS_SCRIPT" <<'LUA'
+          wrk.method = "OPTIONS"
+          wrk.headers["Origin"] = "https://example.com"
+          wrk.headers["Access-Control-Request-Method"] = "GET"
+          LUA
+
+          run_feature() {
+            local feature_name="$1"
+            local feature_label="$2"
+            local target_url="$3"
+            shift 3
+
+            echo "Warmup ${feature_name}: wrk -t${BENCH_THREADS} -c${BENCH_CONNECTIONS} -d${BENCH_WARMUP_SECONDS}s ${target_url}"
+            wrk -t"$BENCH_THREADS" -c"$BENCH_CONNECTIONS" -d"${BENCH_WARMUP_SECONDS}s" "$@" "$target_url" >/dev/null
+
+            for run in $(seq 1 "$BENCH_RUNS"); do
+              echo "Measured ${feature_name} run $run/$BENCH_RUNS: wrk --latency -t${BENCH_THREADS} -c${BENCH_CONNECTIONS} -d${BENCH_DURATION_SECONDS}s ${target_url}"
+              WRK_OUT=$(wrk --latency -t"$BENCH_THREADS" -c"$BENCH_CONNECTIONS" -d"${BENCH_DURATION_SECONDS}s" "$@" "$target_url")
+              echo "$WRK_OUT"
+
+              FEATURE_RPS=$(printf '%s\n' "$WRK_OUT" | awk '/Requests\/sec/ {print $2}')
+              FEATURE_LAT=$(printf '%s\n' "$WRK_OUT" | awk '$1 == "Latency" {print $2 " " $3; exit}')
+              FEATURE_P50=$(printf '%s\n' "$WRK_OUT" | awk '$1 == "50%" {print $2; exit}')
+              FEATURE_P75=$(printf '%s\n' "$WRK_OUT" | awk '$1 == "75%" {print $2; exit}')
+              FEATURE_P90=$(printf '%s\n' "$WRK_OUT" | awk '$1 == "90%" {print $2; exit}')
+              FEATURE_P99=$(printf '%s\n' "$WRK_OUT" | awk '$1 == "99%" {print $2; exit}')
+              printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$feature_name" "$feature_label" "$target_url" "$run" "$FEATURE_RPS" "$FEATURE_LAT" "$FEATURE_P50" "$FEATURE_P75" "$FEATURE_P90" "$FEATURE_P99" >> "$FEATURE_RESULT_FILE"
+
+              ZONO_RSS_AFTER=$(read_rss_kb "$ZONO_PID")
+              if [ "$ZONO_RSS_AFTER" -gt "$ZONO_RSS_KB" ]; then
+                ZONO_RSS_KB=$ZONO_RSS_AFTER
+              fi
+            done
+          }
+
+          run_feature text "Text response" "http://127.0.0.1:3003/api/text"
+          run_feature json "JSON response" "http://127.0.0.1:3003/api/json"
+          run_feature html "HTML response" "http://127.0.0.1:3003/api/html"
+          run_feature body "Raw body response" "http://127.0.0.1:3003/api/body"
+          run_feature params "Route params" "http://127.0.0.1:3003/api/params/123"
+          run_feature query "Query lookup" "http://127.0.0.1:3003/api/query?name=zono&mode=fast"
+          run_feature header "Header lookup" "http://127.0.0.1:3003/api/header" -H "x-bench: zono"
+          run_feature cookie "Cookie read/write" "http://127.0.0.1:3003/api/cookie" -H "Cookie: bench=zono; mode=fast"
+          run_feature redirect "Redirect response" "http://127.0.0.1:3003/api/redirect"
+          run_feature middleware "Middleware chain" "http://127.0.0.1:3003/api/middleware"
+          run_feature stream "Stream response" "http://127.0.0.1:3003/api/stream"
+          run_feature file "File response" "http://127.0.0.1:3003/api/file"
+          run_feature post_json "POST JSON body" "http://127.0.0.1:3003/api/post-json" -s "$POST_SCRIPT"
+          run_feature cors_preflight "CORS preflight" "http://127.0.0.1:3003/api/cors" -s "$CORS_SCRIPT"
+
+          FEATURE_JSON=$(python3 - "$FEATURE_RESULT_FILE" <<'PY'
+          import json
+          import sys
+          from collections import OrderedDict
+
+          features = OrderedDict()
+          with open(sys.argv[1], "r", encoding="utf-8") as fh:
+              for line in fh:
+                  name, label, url, run, rps, latency, p50, p75, p90, p99 = line.rstrip("\n").split("\t")
+                  entry = features.setdefault(name, {
+                      "name": name,
+                      "label": label,
+                      "url": url,
+                      "runs": [],
+                  })
+                  entry["runs"].append({
+                      "run": int(run),
+                      "requests_per_sec": float(rps),
+                      "avg_latency": latency,
+                      "latency_p50": p50,
+                      "latency_p75": p75,
+                      "latency_p90": p90,
+                      "latency_p99": p99,
+                  })
+
+          output = []
+          for entry in features.values():
+              median = sorted(entry["runs"], key=lambda item: item["requests_per_sec"])[len(entry["runs"]) // 2]
+              output.append({
+                  "name": entry["name"],
+                  "label": entry["label"],
+                  "url": entry["url"],
+                  "requests_per_sec": median["requests_per_sec"],
+                  "avg_latency": median["avg_latency"],
+                  "latency_p50": median["latency_p50"],
+                  "latency_p75": median["latency_p75"],
+                  "latency_p90": median["latency_p90"],
+                  "latency_p99": median["latency_p99"],
+                  "runs": entry["runs"],
+              })
+
+          print(json.dumps(output, separators=(",", ":")))
+          PY
+          )
+
+          eval "$(python3 - "$FEATURE_JSON" <<'PY'
+          import json
+          import shlex
+          import sys
+
+          features = json.loads(sys.argv[1])
+          main = next(item for item in features if item["name"] == "json")
+          values = {
+              "ZONO_RPS": main["requests_per_sec"],
+              "ZONO_LAT": main["avg_latency"],
+              "ZONO_P50": main["latency_p50"],
+              "ZONO_P75": main["latency_p75"],
+              "ZONO_P90": main["latency_p90"],
+              "ZONO_P99": main["latency_p99"],
+          }
+          for key, value in values.items():
+              print(f"{key}={shlex.quote(str(value))}")
+          PY
+          )"
+
+          ZONO_RAM_MB=$(awk "BEGIN{printf \"%.1f\", ${ZONO_RSS_KB:-0} / 1024}")
+
+          {
+            echo "build_ms=$BUILD_MS"
+            echo "binary_size=$ZONO_SIZE"
+            echo "binary_bytes=$ZONO_BYTES"
+            echo "source_files=$ZONO_FILES"
+            echo "requests_per_sec=$ZONO_RPS"
+            echo "ram_mb=$ZONO_RAM_MB"
+            echo "zig_version=$ZONO_ZIG_VERSION"
+            echo "runtime_deps=$ZONO_RUNTIME_DEPS"
+            echo "latency_p50=$ZONO_P50"
+            echo "latency_p75=$ZONO_P75"
+            echo "latency_p90=$ZONO_P90"
+            echo "latency_p99=$ZONO_P99"
+            echo "feature_benchmarks=$FEATURE_JSON"
+            echo "avg_latency<<EOF"
+            echo "$ZONO_LAT"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+  benchmark_merjs:
+    runs-on: ubuntu-latest
+    name: merjs API benchmark
+    needs:
+      - benchmark_zono
+    outputs:
+      build_ms: ${{ steps.bench.outputs.build_ms }}
+      binary_size: ${{ steps.bench.outputs.binary_size }}
+      binary_bytes: ${{ steps.bench.outputs.binary_bytes }}
+      source_files: ${{ steps.bench.outputs.source_files }}
+      requests_per_sec: ${{ steps.bench.outputs.requests_per_sec }}
+      avg_latency: ${{ steps.bench.outputs.avg_latency }}
+      latency_p50: ${{ steps.bench.outputs.latency_p50 }}
+      latency_p75: ${{ steps.bench.outputs.latency_p75 }}
+      latency_p90: ${{ steps.bench.outputs.latency_p90 }}
+      latency_p99: ${{ steps.bench.outputs.latency_p99 }}
+      ram_mb: ${{ steps.bench.outputs.ram_mb }}
+      zig_version: ${{ steps.bench.outputs.zig_version }}
+      baseline_ref: ${{ steps.bench.outputs.baseline_ref }}
+      runtime_deps: ${{ steps.bench.outputs.runtime_deps }}
+
+    steps:
+      - name: Checkout zono
+        uses: actions/checkout@v6.0.2
+
+      - name: Setup Zig
+        uses: ./.github/actions/setup-zig
+        with:
+          version: ${{ env.MERJS_ZIG_VERSION }}
+
+      - name: Install wrk
+        run: sudo apt-get update && sudo apt-get install -y wrk
+
+      - name: Benchmark merjs
+        id: bench
+        env:
+          MERJS_ZIG_VERSION: ${{ env.MERJS_ZIG_VERSION }}
+          MERJS_BASELINE_REF: ${{ env.MERJS_BASELINE_REF }}
+        run: |
+          set -euo pipefail
+
+          read_rss_kb() {
+            local pid="$1"
+            local rss
+            rss=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
+            if [ -z "$rss" ]; then
+              echo 0
+            else
+              echo "$rss"
+            fi
+          }
+
+          git init merjs-baseline
+          cd merjs-baseline
+          git remote add origin https://github.com/justrach/merjs.git
+          git fetch --depth 1 origin "refs/tags/$MERJS_BASELINE_REF:refs/tags/$MERJS_BASELINE_REF"
+          git checkout --detach "$MERJS_BASELINE_REF"
+          cd ..
+
+          # v0.2.5 ships both evented and threaded runtimes. Force the shipped
+          # threaded fallback on Linux CI because the default io_uring path
+          # currently fails to compile under ubuntu-latest + Zig 0.16.0.
+          cp merjs-baseline/src/runtime_threaded.zig merjs-baseline/src/runtime.zig
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("merjs-baseline/src/runtime.zig")
+          text = path.read_text(encoding="utf-8")
+          text = text.replace(
+              "pub fn init(gpa: std.mem.Allocator) void {",
+              "pub fn init(gpa: std.mem.Allocator) !void {",
+              1,
+          )
+          path.write_text(text, encoding="utf-8")
+          PY
+
+          rm -rf merjs-baseline/examples/site/app merjs-baseline/examples/site/api
+          mkdir -p merjs-baseline/examples/site/app merjs-baseline/examples/site/api
+          cp merjs-baseline/examples/starter/app/*.zig merjs-baseline/examples/site/app/
+          cat > merjs-baseline/examples/site/api/json.zig <<'EOF'
+          const mer = @import("mer");
+
+          const JsonResponse = struct {
+              ok: bool,
+              framework: []const u8,
+          };
+
+          pub fn render(req: mer.Request) mer.Response {
+              return mer.typedJson(req.allocator, JsonResponse{
+                  .ok = true,
+                  .framework = "merjs",
+              });
+          }
+          EOF
+
+          cd merjs-baseline
+          START=$(date +%s%N)
+          zig build -Doptimize=ReleaseFast
+          END=$(date +%s%N)
+          BUILD_MS=$(( (END - START) / 1000000 ))
+
+          MERJS_BIN="$(pwd)/zig-out/bin/merjs"
+          if [ ! -f "$MERJS_BIN" ]; then
+            echo "Could not locate the built merjs binary" >&2
+            exit 1
+          fi
+
+          MERJS_SIZE=$(du -sh "$MERJS_BIN" | cut -f1)
+          MERJS_BYTES=$(stat --format=%s "$MERJS_BIN")
+          MERJS_FILES=$(find src examples/site/app examples/site/api examples/site/wasm -name '*.zig' | wc -l)
+
+          "$MERJS_BIN" --port 3002 --no-dev &
+          MERJS_PID=$!
+          trap 'kill $MERJS_PID 2>/dev/null || true' EXIT
+
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:3002/api/json >/dev/null; then
+              break
+            fi
+            sleep 1
+            if [ "$attempt" -eq 30 ]; then
+              echo "merjs baseline did not become ready in time" >&2
+              exit 1
+            fi
+          done
+
+          if [ $((BENCH_RUNS % 2)) -eq 0 ]; then
+            echo "BENCH_RUNS must be an odd number to compute a median" >&2
+            exit 1
+          fi
+
+          echo "Warmup run: wrk -t${BENCH_THREADS} -c${BENCH_CONNECTIONS} -d${BENCH_WARMUP_SECONDS}s http://127.0.0.1:3002/api/json"
+          wrk -t"$BENCH_THREADS" -c"$BENCH_CONNECTIONS" -d"${BENCH_WARMUP_SECONDS}s" http://127.0.0.1:3002/api/json >/dev/null
+
+          RESULT_FILE=$(mktemp)
+          trap 'rm -f "$RESULT_FILE"; kill $MERJS_PID 2>/dev/null || true' EXIT
+          MERJS_RSS_KB=$(read_rss_kb "$MERJS_PID")
+
+          for run in $(seq 1 "$BENCH_RUNS"); do
+            echo "Measured run $run/$BENCH_RUNS: wrk --latency -t${BENCH_THREADS} -c${BENCH_CONNECTIONS} -d${BENCH_DURATION_SECONDS}s http://127.0.0.1:3002/api/json"
+            WRK_OUT=$(wrk --latency -t"$BENCH_THREADS" -c"$BENCH_CONNECTIONS" -d"${BENCH_DURATION_SECONDS}s" http://127.0.0.1:3002/api/json)
+            echo "$WRK_OUT"
+
+            MERJS_RPS=$(printf '%s\n' "$WRK_OUT" | awk '/Requests\/sec/ {print $2}')
+            MERJS_LAT=$(printf '%s\n' "$WRK_OUT" | awk '$1 == "Latency" {print $2 " " $3; exit}')
+            MERJS_P50=$(printf '%s\n' "$WRK_OUT" | awk '$1 == "50%" {print $2; exit}')
+            MERJS_P75=$(printf '%s\n' "$WRK_OUT" | awk '$1 == "75%" {print $2; exit}')
+            MERJS_P90=$(printf '%s\n' "$WRK_OUT" | awk '$1 == "90%" {print $2; exit}')
+            MERJS_P99=$(printf '%s\n' "$WRK_OUT" | awk '$1 == "99%" {print $2; exit}')
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$run" "$MERJS_RPS" "$MERJS_LAT" "$MERJS_P50" "$MERJS_P75" "$MERJS_P90" "$MERJS_P99" >> "$RESULT_FILE"
+
+            MERJS_RSS_AFTER=$(read_rss_kb "$MERJS_PID")
+            if [ "$MERJS_RSS_AFTER" -gt "$MERJS_RSS_KB" ]; then
+              MERJS_RSS_KB=$MERJS_RSS_AFTER
+            fi
+          done
+
+          MEDIAN_ROW=$(sort -k2,2n "$RESULT_FILE" | sed -n "$(( (BENCH_RUNS + 1) / 2 ))p")
+          MERJS_RPS=$(printf '%s' "$MEDIAN_ROW" | cut -f2)
+          MERJS_LAT=$(printf '%s' "$MEDIAN_ROW" | cut -f3)
+          MERJS_P50=$(printf '%s' "$MEDIAN_ROW" | cut -f4)
+          MERJS_P75=$(printf '%s' "$MEDIAN_ROW" | cut -f5)
+          MERJS_P90=$(printf '%s' "$MEDIAN_ROW" | cut -f6)
+          MERJS_P99=$(printf '%s' "$MEDIAN_ROW" | cut -f7)
+          MERJS_RAM_MB=$(awk "BEGIN{printf \"%.1f\", ${MERJS_RSS_KB:-0} / 1024}")
+
+          {
+            echo "build_ms=$BUILD_MS"
+            echo "binary_size=$MERJS_SIZE"
+            echo "binary_bytes=$MERJS_BYTES"
+            echo "source_files=$MERJS_FILES"
+            echo "requests_per_sec=$MERJS_RPS"
+            echo "ram_mb=$MERJS_RAM_MB"
+            echo "zig_version=$MERJS_ZIG_VERSION"
+            echo "baseline_ref=$MERJS_BASELINE_REF"
+            echo "runtime_deps=$MERJS_RUNTIME_DEPS"
+            echo "latency_p50=$MERJS_P50"
+            echo "latency_p75=$MERJS_P75"
+            echo "latency_p90=$MERJS_P90"
+            echo "latency_p99=$MERJS_P99"
+            echo "avg_latency<<EOF"
+            echo "$MERJS_LAT"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+  publish_benchmark:
+    runs-on: ubuntu-latest
+    name: Publish benchmark summary
+    needs:
+      - benchmark_zono
+      - benchmark_merjs
+    if: ${{ always() }}
+    env:
+      ZONO_RESULT: ${{ needs.benchmark_zono.result }}
+      ZONO_BUILD_MS: ${{ needs.benchmark_zono.outputs.build_ms || '0' }}
+      ZONO_BINARY_SIZE: ${{ needs.benchmark_zono.outputs.binary_size || 'n/a' }}
+      ZONO_BINARY_BYTES: ${{ needs.benchmark_zono.outputs.binary_bytes || '0' }}
+      ZONO_SOURCE_FILES: ${{ needs.benchmark_zono.outputs.source_files || '0' }}
+      ZONO_RPS: ${{ needs.benchmark_zono.outputs.requests_per_sec || 'n/a' }}
+      ZONO_LAT: ${{ needs.benchmark_zono.outputs.avg_latency || 'n/a' }}
+      ZONO_P50: ${{ needs.benchmark_zono.outputs.latency_p50 || 'n/a' }}
+      ZONO_P75: ${{ needs.benchmark_zono.outputs.latency_p75 || 'n/a' }}
+      ZONO_P90: ${{ needs.benchmark_zono.outputs.latency_p90 || 'n/a' }}
+      ZONO_P99: ${{ needs.benchmark_zono.outputs.latency_p99 || 'n/a' }}
+      ZONO_FEATURE_BENCHMARKS: ${{ needs.benchmark_zono.outputs.feature_benchmarks || '[]' }}
+      ZONO_RAM_MB: ${{ needs.benchmark_zono.outputs.ram_mb || 'n/a' }}
+      ZONO_ZIG_VERSION: ${{ needs.benchmark_zono.outputs.zig_version || '0.16.0' }}
+      ZONO_RUNTIME_DEPS: ${{ needs.benchmark_zono.outputs.runtime_deps || 'zio v0.11.0' }}
+
+      MERJS_RESULT: ${{ needs.benchmark_merjs.result }}
+      MERJS_BUILD_MS: ${{ needs.benchmark_merjs.outputs.build_ms || '0' }}
+      MERJS_BINARY_SIZE: ${{ needs.benchmark_merjs.outputs.binary_size || 'n/a' }}
+      MERJS_BINARY_BYTES: ${{ needs.benchmark_merjs.outputs.binary_bytes || '0' }}
+      MERJS_SOURCE_FILES: ${{ needs.benchmark_merjs.outputs.source_files || '0' }}
+      MERJS_RPS: ${{ needs.benchmark_merjs.outputs.requests_per_sec || 'n/a' }}
+      MERJS_LAT: ${{ needs.benchmark_merjs.outputs.avg_latency || 'n/a' }}
+      MERJS_P50: ${{ needs.benchmark_merjs.outputs.latency_p50 || 'n/a' }}
+      MERJS_P75: ${{ needs.benchmark_merjs.outputs.latency_p75 || 'n/a' }}
+      MERJS_P90: ${{ needs.benchmark_merjs.outputs.latency_p90 || 'n/a' }}
+      MERJS_P99: ${{ needs.benchmark_merjs.outputs.latency_p99 || 'n/a' }}
+      MERJS_RAM_MB: ${{ needs.benchmark_merjs.outputs.ram_mb || 'n/a' }}
+      MERJS_ZIG_VERSION: ${{ needs.benchmark_merjs.outputs.zig_version || '0.16.0' }}
+      MERJS_BASELINE_REF: ${{ needs.benchmark_merjs.outputs.baseline_ref || 'v0.2.5' }}
+      MERJS_RUNTIME_DEPS: ${{ needs.benchmark_merjs.outputs.runtime_deps || '0' }}
+
+    steps:
+      - name: Checkout zono
+        uses: actions/checkout@v6.0.2
+
+      - name: Post comparison
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+          ## Backend API Benchmark
+
+          Target route:
+          `GET /api/json` for zono and merjs
+
+          Response shape:
+          `{ "ok": true, "framework": "..." }`
+
+          ### Job status
+
+          | Target | Status | Toolchain |
+          |--------|--------|-----------|
+          EOF
+
+          echo "| zono | $ZONO_RESULT | Zig $ZONO_ZIG_VERSION |" >> $GITHUB_STEP_SUMMARY
+          echo "| merjs | $MERJS_RESULT | Zig $MERJS_ZIG_VERSION (\`$MERJS_BASELINE_REF\` release) |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+          ### Results
+
+          | Metric | **zono** | **merjs** |
+          |--------|----------|-----------|
+          EOF
+
+          echo "| Server binary | $ZONO_BINARY_SIZE | $MERJS_BINARY_SIZE |" >> $GITHUB_STEP_SUMMARY
+          echo "| Source files | $ZONO_SOURCE_FILES files | $MERJS_SOURCE_FILES files |" >> $GITHUB_STEP_SUMMARY
+          echo "| Runtime deps | $ZONO_RUNTIME_DEPS | $MERJS_RUNTIME_DEPS |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Requests/sec** (wrk median, ${BENCH_THREADS}t/${BENCH_CONNECTIONS}c/${BENCH_DURATION_SECONDS}s) | **${ZONO_RPS}** | **${MERJS_RPS}** |" >> $GITHUB_STEP_SUMMARY
+          echo "| Avg latency (avg stdev) | ${ZONO_LAT} | ${MERJS_LAT} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Latency p50 | ${ZONO_P50} | ${MERJS_P50} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Latency p75 | ${ZONO_P75} | ${MERJS_P75} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Latency p90 | ${ZONO_P90} | ${MERJS_P90} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Latency p99 | ${ZONO_P99} | ${MERJS_P99} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **RAM usage** (under load) | **${ZONO_RAM_MB} MB** | **${MERJS_RAM_MB} MB** |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### zono Feature Matrix" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Feature | Route | Requests/sec | Avg latency | p99 |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-------|--------------|-------------|-----|" >> $GITHUB_STEP_SUMMARY
+          python3 - <<'PY' >> $GITHUB_STEP_SUMMARY
+          import json
+          import os
+
+          for item in json.loads(os.environ["ZONO_FEATURE_BENCHMARKS"]):
+              print(
+                  f'| {item["label"]} | `{item["url"].replace("http://127.0.0.1:3003", "")}` | '
+                  f'**{item["requests_per_sec"]:.2f}** | {item["avg_latency"]} | {item["latency_p99"]} |'
+              )
+          PY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> zono now runs a per-feature matrix on the same benchmark server. Each feature gets one ${BENCH_WARMUP_SECONDS}s warmup plus ${BENCH_RUNS} measured wrk --latency runs, and the published Requests/sec is the median run with its matching latency distribution. The headline comparison still uses zono \`GET /api/json\` against the merjs \`GET /api/json\` baseline. merjs uses upstream release tag \`$MERJS_BASELINE_REF\`; Linux CI switches to its shipped threaded runtime fallback because the default io_uring path currently fails to compile under ubuntu-latest." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> Snapshot artifacts are published to the artifact-only \`$BENCHMARK_RESULTS_BRANCH\` branch. The branch keeps normal Git history plus timestamped files under \`history/\`; the \`main\` README embeds the latest SVG from that branch." >> $GITHUB_STEP_SUMMARY
+
+      - name: Fail if any benchmark job failed
+        if: ${{ needs.benchmark_zono.result != 'success' || needs.benchmark_merjs.result != 'success' }}
+        run: |
+          echo "::error::One or more benchmark jobs failed; benchmark snapshot branch was not updated."
+          exit 1
+
+      - name: Save benchmark artifacts
+        run: |
+          ARTIFACT_DIR="$RUNNER_TEMP/benchmarks"
+          python3 .github/scripts/render_benchmark_artifacts.py render "$ARTIFACT_DIR"
+
+      - name: Commit benchmark artifacts
+        if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          ARTIFACT_ROOT="$RUNNER_TEMP/benchmarks"
+          PUBLISH_DIR="$RUNNER_TEMP/benchmark-publish"
+          rm -rf "$PUBLISH_DIR"
+          mkdir -p "$PUBLISH_DIR"
+
+          cd "$PUBLISH_DIR"
+          git init
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          remote_host="${GITHUB_SERVER_URL#https://}"
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@${remote_host}/${GITHUB_REPOSITORY}.git"
+
+          if git ls-remote --exit-code --heads origin "$BENCHMARK_RESULTS_BRANCH" >/dev/null 2>&1; then
+            git fetch origin "refs/heads/$BENCHMARK_RESULTS_BRANCH:refs/remotes/origin/$BENCHMARK_RESULTS_BRANCH"
+            git checkout -B "$BENCHMARK_RESULTS_BRANCH" "refs/remotes/origin/$BENCHMARK_RESULTS_BRANCH"
+          else
+            git checkout --orphan "$BENCHMARK_RESULTS_BRANCH"
+          fi
+
+          rm -rf benchmarks
+          cp -R "$ARTIFACT_ROOT"/. "$PUBLISH_DIR"/
+          python3 "$GITHUB_WORKSPACE/.github/scripts/render_benchmark_artifacts.py" index "$PUBLISH_DIR"
+
+          git add -A .
+          if git diff --staged --quiet; then
+            echo "No benchmark artifacts to publish."
+            exit 0
+          fi
+
+          git commit -m "bench: update latest benchmark snapshot [skip ci]"
+          git push origin "HEAD:refs/heads/$BENCHMARK_RESULTS_BRANCH"

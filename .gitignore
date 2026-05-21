@@ -1,0 +1,7 @@
+.zig-cache/
+zig-pkg/
+zig-out/
+spider/
+examples/uploads/
+codemap.md
+**/codemap.md

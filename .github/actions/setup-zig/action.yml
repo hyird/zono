@@ -1,0 +1,30 @@
+name: Setup Zig
+description: Install a pinned Zig release on ubuntu-latest without JavaScript action runtime warnings.
+
+inputs:
+  version:
+    description: Zig version to install, for example 0.16.0.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Install Zig
+      shell: bash
+      env:
+        ZIG_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+
+        zig_dir="$RUNNER_TOOL_CACHE/zig/$ZIG_VERSION/x64"
+        if [ ! -x "$zig_dir/zig" ]; then
+          archive="$RUNNER_TEMP/zig-$ZIG_VERSION.tar.xz"
+          curl -fsSL "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz" -o "$archive"
+          rm -rf "$RUNNER_TEMP/zig-x86_64-linux-$ZIG_VERSION" "$zig_dir"
+          tar -xJf "$archive" -C "$RUNNER_TEMP"
+          mkdir -p "$(dirname "$zig_dir")"
+          mv "$RUNNER_TEMP/zig-x86_64-linux-$ZIG_VERSION" "$zig_dir"
+        fi
+
+        echo "$zig_dir" >> "$GITHUB_PATH"
+        "$zig_dir/zig" version
